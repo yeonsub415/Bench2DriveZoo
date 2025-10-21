@@ -34,6 +34,7 @@ class UniAD(UniADTrack):
         **kwargs,
     ):
         super(UniAD, self).__init__(**kwargs)
+        self.keep_bev_for_export = False
         if seg_head:
             self.seg_head = build_head(seg_head)
         if occ_head:
@@ -313,8 +314,14 @@ class UniAD(UniADTrack):
         
         bev_embed = result_track[0]["bev_embed"]
         
-        if self.prev_frame_num > 0:        
-            self.prev_frame_infos.append(self.prev_frame_info)        
+        if self.keep_bev_for_export:
+            # Move a detached copy to CPU so downstream export utilities can
+            # serialise the tensor without holding onto GPU memory or autograd
+            # history.
+            result[0]['bev_embed'] = bev_embed.detach().cpu()
+
+        if self.prev_frame_num > 0:
+            self.prev_frame_infos.append(self.prev_frame_info)       
         
         
 
@@ -351,7 +358,9 @@ class UniAD(UniADTrack):
                 result_planning=result_planning,
             )
 
-        pop_track_list = ['prev_bev', 'bev_pos', 'bev_embed', 'track_query_embeddings', 'sdc_embedding']
+        pop_track_list = ['prev_bev', 'bev_pos', 'track_query_embeddings', 'sdc_embedding']
+        if not self.keep_bev_for_export:
+            pop_track_list.append('bev_embed')
         result_track[0] = pop_elem_in_result(result_track[0], pop_track_list)
 
         if self.with_seg_head:

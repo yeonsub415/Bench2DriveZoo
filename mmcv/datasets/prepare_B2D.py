@@ -1,10 +1,54 @@
 import os
 from os.path import join
 import gzip, json, pickle
+from pathlib import Path
+
 import numpy as np
 from pyquaternion import Quaternion
 from tqdm import tqdm
-from vis_utils import calculate_cube_vertices,calculate_occlusion_stats,edges,DIS_CAR_SAVE
+# Only import the lightweight utilities that are required for dataset generation.
+# The visualisation helpers pull in heavy GUI dependencies (open3d, dash, flask,
+# etc.) which are not needed when preparing the Bench2Drive annotations and can
+# fail on minimal Windows environments.  To keep the preprocessing script
+# runnable without those optional packages we try to import the helpers and fall
+# back to pure NumPy implementations if they are unavailable.
+try:
+    from vis_utils import calculate_cube_vertices, calculate_occlusion_stats
+except ImportError:  # pragma: no cover - optional dependency
+    def calculate_cube_vertices(center, extent):
+        """Fallback vertex generator that mirrors the vis_utils behaviour."""
+
+        cx, cy, cz = center
+        x, y, z = extent
+        return [
+            (cx + x, cy + y, cz + z),
+            (cx + x, cy + y, cz - z),
+            (cx + x, cy - y, cz + z),
+            (cx + x, cy - y, cz - z),
+            (cx - x, cy + y, cz + z),
+            (cx - x, cy + y, cz - z),
+            (cx - x, cy - y, cz + z),
+            (cx - x, cy - y, cz - z),
+        ]
+
+    def calculate_occlusion_stats(bbox_points, depth, depth_map, max_render_depth):
+        """Minimal occlusion estimator used as a last resort fallback."""
+
+        num_visible_vertices = 0
+        num_invisible_vertices = 0
+        num_vertices_outside_camera = 0
+        for i, (x_2d, y_2d) in enumerate(bbox_points):
+            point_depth = depth[i]
+            if max_render_depth > point_depth > 0:
+                num_visible_vertices += 1
+            else:
+                num_vertices_outside_camera += 1
+        return (
+            num_visible_vertices,
+            num_invisible_vertices,
+            num_vertices_outside_camera,
+            [],
+        )
 import cv2
 import multiprocessing
 import argparse
@@ -189,9 +233,14 @@ def gengrate_map(map_root):
     with open(join(OUT_DIR,'b2d_map_infos.pkl'),'wb') as f:
         pickle.dump(map_infos,f)
 
+def _to_posix_path(path_obj):
+    """Return a POSIX-style string for JSON serialisation compatibility."""
+
+    return path_obj.as_posix()
+
 def preprocess(folder_list,idx,tmp_dir,train_or_val):
 
-    data_root = DATAROOT
+    data_root = Path(DATAROOT)
     cameras = CAMERAS
     final_data = []
     if idx == 0:
@@ -200,22 +249,59 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
         folders = folder_list
 
     for folder_name in folders:
-        folder_path = join(data_root, folder_name)
+        folder_rel = Path(folder_name)
+        folder_path = data_root / folder_rel
+        if not folder_path.is_dir():
+            print(f"[prepare_B2D] Skip missing folder: {folder_path}")
+            continue
+        ann_dir = folder_path / 'anno'
+        if not ann_dir.is_dir():
+            print(f"[prepare_B2D] Skip {folder_path}, no 'anno' directory found.")
+            continue
         last_position_dict = {}
-        for ann_name in sorted(os.listdir(join(folder_path,'anno')),key= lambda x: int(x.split('.')[0])):
+        ann_files = []
+        for ann_path in ann_dir.glob('*.json*'):
+            token = ann_path.name.split('.')[0]
+            if not token.isdigit():
+                print(f"[prepare_B2D] Skip annotation {ann_path}, unexpected name pattern.")
+                continue
+            ann_files.append((int(token), ann_path))
+        ann_files.sort(key=lambda item: item[0])
+        if not ann_files:
+            print(f"[prepare_B2D] Skip {folder_path}, no annotation files found.")
+            continue
+        expert_dir = folder_path / 'expert_assessment'
+        if not expert_dir.is_dir():
+            print(f"[prepare_B2D] Skip {folder_path}, missing expert_assessment directory.")
+            continue
+        for _, ann_path in ann_files:
             position_dict = {}
             frame_data = {}
             cam_gray_depth = {}
-            with gzip.open(join(folder_path,'anno',ann_name), 'rt', encoding='utf-8') as gz_file:
-                anno = json.load(gz_file) 
+            with gzip.open(ann_path, 'rt', encoding='utf-8') as gz_file:
+                anno = json.load(gz_file)
             frame_data['folder'] = folder_name
-            frame_data['town_name'] =  folder_name.split('/')[1].split('_')[1]
+            folder_parts = Path(folder_name).parts
+            if len(folder_parts) >= 2:
+                town_segment = folder_parts[1]
+            else:
+                town_segment = folder_parts[0]
+            town_name = town_segment.split('_')[0] if '_' in town_segment else town_segment
+            folder_parts = folder_rel.parts
+            if len(folder_parts) >= 2:
+                town_segment = folder_parts[1]
+            else:
+                town_segment = folder_parts[0]
+            town_name = town_segment.split('_')[0] if '_' in town_segment else town_segment
+            frame_data['town_name'] = town_name
             frame_data['command_far_xy'] = np.array([anno['x_command_far'],-anno['y_command_far']])
             frame_data['command_far'] = anno['command_far']
             frame_data['command_near_xy'] = np.array([anno['x_command_near'],-anno['y_command_near']])
             frame_data['command_near'] = anno['command_near']
-            frame_data['frame_idx'] = int(ann_name.split('.')[0])
-            frame_data['ego_yaw'] = -np.nan_to_num(anno['theta'],nan=np.pi)+np.pi/2  
+            frame_token = ann_path.name.split('.')[0]
+            frame_idx = int(frame_token)
+            frame_data['frame_idx'] = frame_idx
+            frame_data['ego_yaw'] = -np.nan_to_num(anno['theta'],nan=np.pi)+np.pi/2
             frame_data['ego_translation'] = np.array([anno['x'],-anno['y'],0])
             frame_data['ego_vel'] = np.array([anno['speed'],0,0])
             frame_data['ego_accel'] = np.array([anno['acceleration'][0],-anno['acceleration'][1],anno['acceleration'][2]])
@@ -223,10 +309,13 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
             frame_data['ego_size'] = np.array([anno['bounding_boxes'][0]['extent'][1],anno['bounding_boxes'][0]['extent'][0],anno['bounding_boxes'][0]['extent'][2]])*2
             world2ego = left2right @ anno['bounding_boxes'][0]['world2ego'] @ left2right
             frame_data['world2ego'] = world2ego
-            if frame_data['frame_idx'] == 0:
-                expert_file_path = join(folder_path,'expert_assessment','-0001.npz')
+            if frame_idx == 0:
+                expert_file_path = expert_dir / '-0001.npz'
             else:
-                expert_file_path = join(folder_path,'expert_assessment',str(frame_data['frame_idx']-1).zfill(5)+'.npz')
+                expert_file_path = expert_dir / f"{frame_idx-1:05d}.npz"
+            if not expert_file_path.is_file():
+                print(f"[prepare_B2D] Missing expert assessment file {expert_file_path}, skipping frame.")
+                continue
             expert_data = np.load(expert_file_path,allow_pickle=True)['arr_0']
             action_id = expert_data[-1]
             # value = expert_data[-2]
@@ -242,11 +331,19 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
             sensor_infos = {}
             for cam in CAMERAS:
                 sensor_infos[cam] = {}
-                sensor_infos[cam]['cam2ego'] = left2right @ np.array(anno['sensors'][cam]['cam2ego']) @ stand_to_ue4_rotate 
+                sensor_infos[cam]['cam2ego'] = left2right @ np.array(anno['sensors'][cam]['cam2ego']) @ stand_to_ue4_rotate
                 sensor_infos[cam]['intrinsic'] = np.array(anno['sensors'][cam]['intrinsic'])
                 sensor_infos[cam]['world2cam'] = np.linalg.inv(stand_to_ue4_rotate) @ np.array(anno['sensors'][cam]['world2cam']) @left2right
-                sensor_infos[cam]['data_path'] = join(folder_name,'camera',CAMERA_TO_FOLDER_MAP[cam],ann_name.split('.')[0]+'.jpg')
-                cam_gray_depth[cam] = cv2.imread(join(data_root,sensor_infos[cam]['data_path']).replace('rgb_','depth_').replace('.jpg','.png'))[:,:,0]
+                rgb_folder = CAMERA_TO_FOLDER_MAP[cam]
+                image_rel = folder_rel / 'camera' / rgb_folder / f"{frame_token}.jpg"
+                sensor_infos[cam]['data_path'] = _to_posix_path(image_rel)
+                depth_folder = rgb_folder.replace('rgb_', 'depth_')
+                depth_rel = folder_rel / 'camera' / depth_folder / f"{frame_token}.png"
+                depth_path = data_root / depth_rel
+                depth_img = cv2.imread(str(depth_path), cv2.IMREAD_GRAYSCALE)
+                if depth_img is None:
+                    print(f"[prepare_B2D] Missing depth image for {depth_rel}, skipping occlusion checks.")
+                cam_gray_depth[cam] = depth_img
             sensor_infos['LIDAR_TOP'] = {}
             sensor_infos['LIDAR_TOP']['lidar2ego'] = left2right @ np.array(anno['sensors']['LIDAR_TOP']['lidar2ego']) @ left2right @ lidar_to_righthand_ego
             world2lidar = lefthand_ego_to_lidar @ np.array(anno['sensors']['LIDAR_TOP']['world2lidar']) @ left2right
@@ -298,7 +395,7 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
                 speed_y = speed * np.sin(yaw_local)
 
                 ###fliter_bounding_boxes###
-                if FILTER_INVISINLE:
+                if FILTER_INVISINLE and all(cam_gray_depth[cam] is not None for cam in cameras):
                     valid = False
                     box2lidar = np.eye(4)
                     box2lidar[0:3,0:3] = Quaternion(axis=[0, 0, 1], radians=yaw_local).rotation_matrix
@@ -312,7 +409,7 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
                         verts.append(tmp.tolist()[:-1])
                     for cam in cameras:
                         lidar2cam = np.linalg.inv(frame_data['sensors'][cam]['cam2ego']) @ sensor_infos['LIDAR_TOP']['lidar2ego']
-                        test_points = [] 
+                        test_points = []
                         test_depth = []
                         for vert in verts:
                             point, depth = get_image_point(vert, frame_data['sensors'][cam]['intrinsic'], lidar2cam)
@@ -320,7 +417,12 @@ def preprocess(folder_list,idx,tmp_dir,train_or_val):
                                 test_points.append(point)
                                 test_depth.append(depth)
 
-                        num_visible_vertices, num_invisible_vertices, num_vertices_outside_camera, colored_points = calculate_occlusion_stats(np.array(test_points), np.array(test_depth),  cam_gray_depth[cam], max_render_depth=MAX_DISTANCE)
+                        num_visible_vertices, num_invisible_vertices, num_vertices_outside_camera, colored_points = calculate_occlusion_stats(
+                            np.array(test_points),
+                            np.array(test_depth),
+                            cam_gray_depth[cam],
+                            max_render_depth=MAX_DISTANCE,
+                        )
                         if num_visible_vertices>NUM_VISIBLE_SHRESHOLD and num_vertices_outside_camera<NUM_OUTPOINT_SHRESHOLD:
                             valid = True
                             break
